@@ -141,6 +141,37 @@ class BBoxTransform(nn.Module):
 
         return pred_boxes
 
+def distance2bbox(points, distance):
+    """Decode distance prediction to bounding box.
+    
+    Args:
+        points (Tensor): Shape (B, N, 2) or (N, 2).
+        distance (Tensor): Distance from the given point to 4
+            boundaries (left, top, right, bottom). Shape (B, N, 4) or (N, 4)
+    Returns:
+        Tensor: Boxes with shape (N, 4) or (B, N, 4)
+    """
+    x1 = points[..., 0] + distance[..., 0]
+    y1 = points[..., 1] + distance[..., 1]
+    x2 = points[..., 0] + distance[..., 2]
+    y2 = points[..., 1] + distance[..., 3]
+
+    bboxes = torch.stack([x1, y1, x2, y2], -1)
+    return bboxes
+
+def bbox2distance(points, bboxes):
+    num_points = points.size(0)
+    num_bboxes = bboxes.size(0)
+    bboxes = bboxes[None].expand(num_points, num_bboxes, 4)
+    xs, ys = points[:, 0], points[:, 1]
+    xs = xs[:, None].expand(num_points, num_bboxes)
+    ys = ys[:, None].expand(num_points, num_bboxes)
+    left = bboxes[..., 0] - xs
+    right = bboxes[..., 2] - xs
+    top = bboxes[..., 1] - ys
+    bottom = bboxes[..., 3] - ys
+    bbox_targets = torch.stack((left, top, right, bottom), -1)
+    return bbox_targets
 
 class ClipBoxes(nn.Module):
 

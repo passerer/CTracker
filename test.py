@@ -10,8 +10,7 @@ import skimage
 import torch
 
 from tqdm import tqdm
-from dataloader import CSVDataset, collater, Resizer, AspectRatioBasedSampler, Augmenter, UnNormalizer, Normalizer, \
-    RGB_MEAN, RGB_STD
+from dataloader import RGB_MEAN, RGB_STD
 from scipy.optimize import linear_sum_assignment
 
 #assert torch.__version__.split('.')[1] == '4'
@@ -138,7 +137,7 @@ def draw_caption(image, box, caption, color):
     cv2.putText(image, caption, (b[0], b[1] - 8), cv2.FONT_HERSHEY_PLAIN, 2, color, 2)
 
 
-def run_each_dataset(model_dir, retinanet, dataset_path, subset, cur_dataset, save_video=False, save_image=False):
+def run_each_dataset(model_dir, FcosTracker, dataset_path, subset, cur_dataset, parser):
     print('run ',cur_dataset)
 
     img_list = os.listdir(os.path.join(dataset_path, subset, cur_dataset, 'img1'))
@@ -160,39 +159,48 @@ def run_each_dataset(model_dir, retinanet, dataset_path, subset, cur_dataset, sa
     draw_interval = 5
     img_width = 1920
     img_height = 1080
-    fps = 30
+    fps = 6
+
+    if parser.show_conf:
+        conf_feats = []
 
     for i in range(img_len):
         det_list_all.append([])
 
     for idx in tqdm(range(img_len + 1)):
+    #for idx in tqdm(range(10)):
         i = idx - 1
         with torch.no_grad():
             data_path1 = img_list[min(idx, img_len - 1)]
             img_origin1 = skimage.io.imread(data_path1)
             img_h, img_w, _ = img_origin1.shape
             img_height, img_width = img_h, img_w
-            resize_h, resize_w = math.ceil(img_h / 32) * 32, math.ceil(img_w / 32) * 32
-            img1 = np.zeros((resize_h, resize_w, 3), dtype=img_origin1.dtype)
-            img1[:img_h, :img_w, :] = img_origin1
+            resize_h = img_height
+            resize_w = int(img_w/img_h*resize_h)
+            resize_h, resize_w = math.ceil(resize_h / 32) * 32, math.ceil(resize_w / 32) * 32
+            img1 = (255.0 * skimage.transform.resize(img_origin1, (resize_h, resize_w))).astype(np.uint8)
             img1 = (img1.astype(np.float32) / 255.0 - np.array([[RGB_MEAN]])) / np.array([[RGB_STD]])
             img1 = torch.from_numpy(img1).permute(2, 0, 1).view(1, 3, resize_h, resize_w)
 
-            scores, transformed_anchors, last_feat = retinanet(img1.cuda().float(), last_feat=last_feat)
+            scores, transformed_anchors, last_feat, conf_feat = FcosTracker(img1.cuda().float(), train_mode=False, last_feats=last_feat, return_hm=parser.show_conf)
+
+            if parser.show_conf:
+                conf_feats.append(conf_feat)
+
             if idx > 0:
                 idxs = np.where(scores > 0.1)
 
                 for j in range(idxs[0].shape[0]):
                     bbox = transformed_anchors[idxs[0][j], :]
-                    x1 = int(bbox[0])
-                    y1 = int(bbox[1])
-                    x2 = int(bbox[2])
-                    y2 = int(bbox[3])
+                    x1 = int(bbox[0]*(img_width/resize_w))
+                    y1 = int(bbox[1]*(img_height/resize_h))
+                    x2 = int(bbox[2]*(img_width/resize_w))
+                    y2 = int(bbox[3]*(img_height/resize_h))
 
-                    x3 = int(bbox[4])
-                    y3 = int(bbox[5])
-                    x4 = int(bbox[6])
-                    y4 = int(bbox[7])
+                    x3 = int(bbox[4]*(img_width/resize_w))
+                    y3 = int(bbox[5]*(img_height/resize_h))
+                    x4 = int(bbox[6]*(img_width/resize_w))
+                    y4 = int(bbox[7]*(img_height/resize_h))
 
                     det_conf = float(scores[idxs[0][j]])
 
@@ -240,6 +248,7 @@ def run_each_dataset(model_dir, retinanet, dataset_path, subset, cur_dataset, sa
     print('save {} result'.format(cur_dataset))
     fout_tracking = open(os.path.join(model_dir, 'results', cur_dataset + '.txt'), 'w')
     for i in tqdm(range(img_len)):
+    #for i in tqdm(range(10)):
         for j in range(len(det_list_all[i])):
             x1, y1, x2, y2 = det_list_all[i][j].curr_rect.astype(int)
             trace_id = det_list_all[i][j].id
@@ -248,25 +257,33 @@ def run_each_dataset(model_dir, retinanet, dataset_path, subset, cur_dataset, sa
                     y2 - y1) + ',-1,-1,-1,-1\n')
     fout_tracking.close()
 
-    if save_video or save_image:
-        if save_video:
+    if parser.save_video or parser.save_image:
+        if parser.save_video:
             out_video = os.path.join(model_dir, 'results', cur_dataset + '.mp4')
             videoWriter = cv2.VideoWriter(out_video, cv2.VideoWriter_fourcc('m', 'p', '4', 'v'), fps, (img_width, img_height))
-        if save_image:
+        if parser.save_image:
             save_img_dir = os.path.join(model_dir, 'results', cur_dataset)
             if not os.path.exists(save_img_dir):
                 os.makedirs(save_img_dir)
         id_dict = {}
         print('visualize {} result'.format(cur_dataset))
         for i in tqdm(range(img_len)):
+        #for i in tqdm(range(10)):
             img = cv2.imread(img_list[i])
+
+            if parser.show_conf:
+                if conf_feats[i] is not None:
+                    color_mask = np.array([0, 0, 255])
+                    conf_feat = cv2.resize(conf_feats[i].cpu().numpy(),(img.shape[1],img.shape[0]))
+                    img = (img * (1-conf_feat[...,None]) + conf_feat[...,None] * color_mask[None,None]).astype(np.uint8)
+
             for j in range(len(det_list_all[i])):
                 x1, y1, x2, y2 = det_list_all[i][j].curr_rect.astype(int)
                 trace_id = det_list_all[i][j].id
 
                 id_dict.setdefault(str(trace_id), []).append((int((x1 + x2) / 2), y2))
                 draw_trace_id = str(trace_id)
-                draw_caption(img, (x1, y1, x2, y2), draw_trace_id, color=color_list[trace_id % len(color_list)])
+                #draw_caption(img, (x1, y1, x2, y2), draw_trace_id, color=color_list[trace_id % len(color_list)])
                 cv2.rectangle(img, (x1, y1), (x2, y2), color=color_list[trace_id % len(color_list)], thickness=2)
 
                 trace_len = len(id_dict[str(trace_id)])
@@ -277,11 +294,11 @@ def run_each_dataset(model_dir, retinanet, dataset_path, subset, cur_dataset, sa
                         draw_point1 = id_dict[str(trace_id)][trace_len - k - 1]
                         draw_point2 = id_dict[str(trace_id)][trace_len - k - 1 - draw_interval]
                         cv2.line(img, draw_point1, draw_point2, color=color_list[trace_id % len(color_list)], thickness=2)
-                if save_image:
-                    cv2.imwrite(os.path.join(save_img_dir, str(i + 1).zfill(6) + '.jpg'), img)
-                if save_video:
-                    videoWriter.write(img)
-        if save_video:
+            if parser.save_image:
+                cv2.imwrite(os.path.join(save_img_dir, str(i + 1).zfill(6) + '.jpg'), img)
+            if parser.save_video:
+                videoWriter.write(img)
+        if parser.save_video:
             videoWriter.release()
 
 def run_from_train(model_dir, root_path):
@@ -289,7 +306,8 @@ def run_from_train(model_dir, root_path):
         os.makedirs(os.path.join(model_dir, 'results'))
     retinanet = torch.load(os.path.join(model_dir, 'model_final.pt'))
 
-    use_gpu = True
+    use_gpu = torch.cuda.is_available()
+    print('use gpu:', use_gpu)
 
     if use_gpu: retinanet = retinanet.cuda()
 
@@ -307,34 +325,37 @@ def eval_metrics(gt_root, dt_root):
               ' --eval_official')
     pass
 
-def main(args=None):
+def main():
     parser = argparse.ArgumentParser(description='Simple script for testing a CTracker network.')
     parser.add_argument('--dataset_path', default='./data', type=str,
                         help='Dataset path, location of the images sequence.')
     parser.add_argument('--model_dir', default='./models', help='Path to model (.pt) file.')
-    parser.add_argument('--model_name', default='model_final.pt', help='Model name, usually ends up with "pt" or "pth".')
-    parser.add_argument('--use_test_dataset',action='store_true',help='Whether to test on test dataset.')
-    parser.add_argument('--save_video', action='store_true',help='Whether to visulize results as video format.')
+    parser.add_argument('--model_name', default='model_final.pt',
+                        help='Model name, usually ends up with "pt" or "pth".')
+    parser.add_argument('--use_test_dataset', action='store_true', help='Whether to test on test dataset.')
+    parser.add_argument('--save_video', action='store_true', help='Whether to visulize results as video format.')
     parser.add_argument('--save_image', action='store_true', help='Whether to visulize results as image format.')
-    parser = parser.parse_args(args)
+    parser.add_argument('--show_conf', action='store_true', help='Show predict confidence heatmap.')
+    parser = parser.parse_args()
 
     if not os.path.exists(os.path.join(parser.model_dir, 'results')):
         os.makedirs(os.path.join(parser.model_dir, 'results'))
 
-    retinanet = torch.load(os.path.join(parser.model_dir, parser.model_name))
-    if isinstance(retinanet,torch.nn.DataParallel):
-        retinanet = retinanet.module
+    FcosTracker = torch.load(os.path.join(parser.model_dir, parser.model_name))
+    if isinstance(FcosTracker,torch.nn.DataParallel):
+        FcosTracker = FcosTracker.module
     use_gpu = True
 
-    if use_gpu: retinanet = retinanet.cuda()
+    if use_gpu: FcosTracker = FcosTracker.cuda()
 
-    retinanet.eval()
+    FcosTracker.eval()
 
     for seq_num in [2, 4, 5, 9, 10, 11, 13]:
-        run_each_dataset(parser.model_dir, retinanet, parser.dataset_path, 'train', 'MOT17-{:02d}'.format(seq_num),parser.save_video,parser.save_image)
+    #for seq_num in [2]:
+        run_each_dataset(parser.model_dir, FcosTracker, parser.dataset_path, 'train', 'MOT17-{:02d}'.format(seq_num), parser)
     if parser.use_test_dataset:
         for seq_num in [1, 3, 6, 7, 8, 12, 14]:
-            run_each_dataset(parser.model_dir, retinanet, parser.dataset_path, 'test', 'MOT17-{:02d}'.format(seq_num),parser.save_video,parser.save_image)
+            run_each_dataset(parser.model_dir, FcosTracker, parser.dataset_path, 'test', 'MOT17-{:02d}'.format(seq_num), parser)
     eval_metrics(os.path.join(parser.dataset_path,'train'),os.path.join(parser.model_dir,'results'))
 
 if __name__ == '__main__':
