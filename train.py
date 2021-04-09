@@ -46,6 +46,7 @@ def main(args=None):
     parser.add_argument('--batch_size', help='Training batch size', type=int, default=8)
     parser.add_argument('--epochs', help='Number of epochs', type=int, default=100)
     parser.add_argument('--show_interval', help='Show loss every N iters', type=int, default=20)
+    parser.add_argument('--save_interval', help='save trained models every N epoch', type=int, default=10)
 
     parser = parser.parse_args(args)
     print(parser)
@@ -137,7 +138,8 @@ def main(args=None):
                 print(fcosTracker.module.reg_scale.data)
                 print('Epoch: {} | Iter: {} | Cls loss: {:1.5f}  | Reg loss: {:1.5f} | Running loss: {:1.5f}'.format(epoch_num, iter_num, float(classification_loss), float(regression_loss), np.mean(loss_hist)))
 
-
+        if (epoch_num+1) % parser.save_interval == 0:
+            torch.save(fcosTracker, os.path.join(parser.model_dir, 'ChainTracker_{}.pt'.format(epoch_num)))
         scheduler.step(np.mean(epoch_loss))
 
     fcosTracker.eval()

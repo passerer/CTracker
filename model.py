@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from utils import BasicBlock, Bottleneck, distance2bbox, bbox2distance, maxpool_nms
 from anchors import Anchors
 from losses import FocalLoss, GiouLoss
-from lib.nms import cython_soft_nms_wrapper, nms
+from lib.nms import nms
 
 
 model_urls = {
@@ -414,9 +414,9 @@ class FCOSTracker(nn.Module):
         bboxes_1 = distance2bbox(mlvl_points, regression[...,:4])
         bboxes_2 = distance2bbox(mlvl_points, regression[...,4:])
         bboxes = torch.cat([bboxes_1,bboxes_2],dim=-1)
-        final_bboxes, index = cython_soft_nms_wrapper(0.7, method='gaussian')(
-           torch.cat([bboxes.contiguous(), cls_scores], dim=2)[0].cpu().numpy())
-        #final_bboxes, index = nms(torch.cat([bboxes.contiguous(), cls_scores], dim=2)[0].cpu().numpy(),0.5)
+        # final_bboxes, index = cython_soft_nms_wrapper(0.7, method='gaussian')(
+        #    torch.cat([bboxes.contiguous(), cls_scores], dim=2)[0].cpu().numpy())
+        final_bboxes, index = nms(torch.cat([bboxes.contiguous(), cls_scores], dim=2)[0].cpu().numpy(),0.5)
 
         return final_bboxes[:, -1], final_bboxes, feats, conf_feat
 
