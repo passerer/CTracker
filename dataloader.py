@@ -390,50 +390,10 @@ def overlap_numpy(box_a, box_b):
     return inter / area_a  # [A,B]
 
 
-class Resizer(object):
-    """Convert ndarrays in sample to Tensors."""
-    def __call__(self, sample, min_side=608, max_side=1024):
-        return sample
-        image, annots, image_next, annots_next = sample['img'], sample['annot'], sample['img_next'], sample['annot_next']
-
-        rows, cols, cns = image.shape
-
-        smallest_side = min(rows, cols)
-
-        # rescale the image so the smallest side is min_side
-        scale = min_side / smallest_side
-
-        # check if the largest side is now greater than max_side, which can happen
-        # when images have a large aspect ratio
-        largest_side = max(rows, cols)
-
-        if largest_side * scale > max_side:
-            scale = max_side / largest_side
-
-        # resize the image with the computed scale
-        image = skimage.transform.resize(image, (int(round(rows*scale)), int(round((cols*scale)))))
-        image_next = skimage.transform.resize(image_next, (int(round(rows*scale)), int(round((cols*scale)))))
-        rows, cols, cns = image.shape
-
-        pad_w = 32 - rows % 32
-        pad_h = 32 - cols % 32
-
-        new_image = np.zeros((rows + pad_w, cols + pad_h, cns)).astype(np.float32)
-        new_image[:rows, :cols, :] = image.astype(np.float32)
-
-        new_image_next = np.zeros((rows + pad_w, cols + pad_h, cns)).astype(np.float32)
-        new_image_next[:rows, :cols, :] = image_next.astype(np.float32)
-
-        annots[:, :4] *= scale
-        annots_next[:, :4] *= scale
-
-        return {'img': torch.from_numpy(new_image), 'annot': torch.from_numpy(annots), 'img_next': torch.from_numpy(new_image_next), 'annot_next': torch.from_numpy(annots_next), 'scale': scale}
-
-
-class Augmenter(object):
+class RandomFlip(object):
     """Convert ndarrays in sample to Tensors."""
 
-    def __call__(self, sample, flip_x=0.5):
+    def __call__(self, sample, flip_x=0.3):
 
         if np.random.rand() < flip_x:
             image, annots = sample['img'], sample['annot']
@@ -441,17 +401,17 @@ class Augmenter(object):
             image = image[:, ::-1, :]
             image_next = image_next[:, ::-1, :]
 
-            rows, cols, _ = image.shape
-            rows_next, cols_next, _ = image_next.shape
-            assert (rows == rows_next) and (cols == cols_next), 'size must be equal between adjacent images pair.'
+            height, width, _ = image.shape
+            height_next, width_next, _ = image_next.shape
+            assert (height == height_next) and (width == width_next), 'size must be equal between adjacent images pair.'
 
             x1 = annots[:, 0].copy()
             x2 = annots[:, 2].copy()
             
             x_tmp = x1.copy()
 
-            annots[:, 0] = cols - x2
-            annots[:, 2] = cols - x_tmp
+            annots[:, 0] = width - x2
+            annots[:, 2] = width - x_tmp
 
             # for next
             x1 = annots_next[:, 0].copy()
@@ -459,8 +419,8 @@ class Augmenter(object):
             
             x_tmp = x1.copy()
 
-            annots_next[:, 0] = cols - x2
-            annots_next[:, 2] = cols - x_tmp
+            annots_next[:, 0] = width - x2
+            annots_next[:, 2] = width - x_tmp
 
             sample = {'img': image, 'annot': annots, 'img_next': image_next, 'annot_next': annots_next}
 
@@ -552,23 +512,23 @@ class PhotometricDistort(object):
 
     def __call__(self, sample):
         image, annots, image_next, annots_next = sample['img'], sample['annot'], sample['img_next'], sample['annot_next']
-        prob = np.random.uniform(0, 1)
         # Apply different distort order
-        img = Image.fromarray(image)
-        img_next = Image.fromarray(image_next)
-        if prob > 0.5:
-            img, img_next = random_brightness(img, img_next)
-            img, img_next = random_contrast(img, img_next)
-            img, img_next = random_saturation(img, img_next)
-            img, img_next = random_hue(img, img_next)
-        else:
-            img, img_next = random_brightness(img, img_next)
-            img, img_next = random_saturation(img, img_next)
-            img, img_next = random_hue(img, img_next)
-            img, img_next = random_contrast(img, img_next)
+        if np.random.uniform(0, 1) > 0.5:
+            img = Image.fromarray(image)
+            img_next = Image.fromarray(image_next)
+            if np.random.uniform(0, 1) > 0.5:
+                img, img_next = random_brightness(img, img_next)
+                img, img_next = random_contrast(img, img_next)
+                img, img_next = random_saturation(img, img_next)
+                img, img_next = random_hue(img, img_next)
+            else:
+                img, img_next = random_brightness(img, img_next)
+                img, img_next = random_saturation(img, img_next)
+                img, img_next = random_hue(img, img_next)
+                img, img_next = random_contrast(img, img_next)
+            image = np.array(img)
+            image_next = np.array(img_next)
 
-        image = np.array(img)
-        image_next = np.array(img_next)
         return {'img': image, 'annot': annots, 'img_next': image_next, 'annot_next': annots_next}
 
 class Compose(object):
@@ -580,99 +540,78 @@ class Compose(object):
             img, image_next = t(img, image_next)
         return img, image_next
 
+
+class RandomResize(object):
+    def __init__(self, resize_range=(0.3, 1.0)):
+        self.resize_range=resize_range
+        assert isinstance(resize_range, tuple) and resize_range[0] < resize_range[1]
+
+    def __call__(self, sample):
+        image, annots, image_next, annots_next = sample['img'], sample['annot'], sample['img_next'], sample[
+            'annot_next']
+        height, width, _ = image.shape
+        resize_h = int(np.random.uniform(self.resize_range[0] * height, self.resize_range[1] * height))
+        resize_w =  int(resize_h/height*width)
+        resize_h += (32 - resize_h % 32)
+        resize_w += (32 - resize_w % 32)
+
+        image = (255.0 * skimage.transform.resize(image, (resize_h, resize_w))).astype(np.uint8)
+        image_next = (255.0 * skimage.transform.resize(image_next, (resize_h, resize_w))).astype(np.uint8)
+        annots[:, 0:4:2] *= (resize_w / width)
+        annots_next[:, 0:4:2] *= (resize_w / width)
+        annots[:, 1:4:2] *= (resize_h / height)
+        annots_next[:, 1:4:2] *= (resize_h / height)
+        return {'img': image, 'annot': annots, 'img_next': image_next, 'annot_next': annots_next}
+
+
 class RandomSampleCrop(object):
-    def __init__(self):
-        pass
+    def __init__(self, min_iou=0.5, crop_range=(0.3, 0.9)):
+        self.min_iou = min_iou
+        self.crop_range = crop_range
+        assert isinstance(crop_range, tuple) and crop_range[0]<crop_range[1]
 
     def __call__(self, sample):
         image, annots, image_next, annots_next = sample['img'], sample['annot'], sample['img_next'], sample['annot_next']
+        if np.random.uniform(0, 1) > 0.3:
+            height, width, _ = image.shape
+            crop_h = np.random.uniform(self.crop_range[0] * height, self.crop_range[1] * height)
+            crop_w = crop_h/height*width
 
-        #print('crop1',image.dtype)
-        height, width, _ = image.shape
-        shorter_side = min(height, width)
-        crop_size = np.random.uniform(0.3 * shorter_side, 0.8 * shorter_side)
-        target_size = 512
-        if shorter_side < 384: 
-            target_size = 256
-        min_iou = 0.2
-        crop_success = False
-        # max trails (10)
-        for _ in range(20):
-            left = np.random.uniform(0, width - crop_size)
-            top = np.random.uniform(0, height - crop_size)
+            crop_success = False
+            # max trails (10)
+            for _ in range(10):
+                left = np.random.uniform(0, width - crop_w)
+                top = np.random.uniform(0, height - crop_h)
 
-            # convert to integer rect x1,y1,x2,y2
-            rect = np.array([int(left), int(top), int(left + crop_size), int(top + crop_size)])
+                # convert to integer rect x1,y1,x2,y2
+                rect = np.array([int(left), int(top), int(left + crop_w), int(top + crop_h)])
 
-            # calculate IoU (jaccard overlap) b/t the cropped and gt boxes
-            overlap = overlap_numpy(annots[:, :4], rect)
-            overlap_next = overlap_numpy(annots_next[:, :4], rect)
+                # calculate IoU (jaccard overlap) b/t the cropped and gt boxes
+                overlap = overlap_numpy(annots[:, :4], rect)
+                overlap_next = overlap_numpy(annots_next[:, :4], rect)
 
-            if overlap.max() < min_iou or overlap_next.max() < min_iou:
-                continue
-            crop_success = True
+                if overlap.max() < self.min_iou or overlap_next.max() < self.min_iou:
+                    continue
+                crop_success = True
+                break
+            if not crop_success:
+                rect = np.array([0, 0, width, height])
+
             image = image[rect[1]:rect[3], rect[0]:rect[2], :]
             image_next = image_next[rect[1]:rect[3], rect[0]:rect[2], :]
-            annots = annots[overlap > min_iou, :].copy()
-            annots_next = annots_next[overlap_next > min_iou, :].copy()
+
+            annots = annots[overlap > self.min_iou, :].copy()
+            annots_next = annots_next[overlap_next > self.min_iou, :].copy()
 
             annots[:, :2] -= rect[:2]
             annots[:, 2:4] -= rect[:2]
-
             annots_next[:, :2] -= rect[:2]
             annots_next[:, 2:4] -= rect[:2]
-            #print('crop1',image.max())
 
-
-            expand_ratio = 1.0
-            if np.random.uniform(0, 1) > 0.75:
-                height, width, depth = image.shape
-                expand_ratio = random.uniform(1, 3)
-                left = random.uniform(0, width * expand_ratio - width)
-                top = random.uniform(0, height * expand_ratio - height)
-
-                expand_image = np.zeros((int(height*expand_ratio), int(width*expand_ratio), depth), dtype=image.dtype)
-        
-                expand_image[:, :, :] = np.array([[RGB_MEAN]]) * 255.0
-                expand_image[int(top):int(top + height),
-                            int(left):int(left + width)] = image
-                image = expand_image
-
-                annots[:, :2] += (int(left), int(top))
-                annots[:, 2:4] += (int(left), int(top))
-
-
-                expand_next_image = np.zeros(
-                    (int(height*expand_ratio), int(width*expand_ratio), depth),
-                    dtype=image_next.dtype)
-                expand_next_image[:, :, :] = np.array([[RGB_MEAN]]) * 255.0
-                expand_next_image[int(top):int(top + height),
-                            int(left):int(left + width)] = image_next
-                image_next = expand_next_image
-
-                annots_next[:, :2] += (int(left), int(top))
-                annots_next[:, 2:4] += (int(left), int(top))
-
-            # resize the image with the computed scale
-
-            
-            # resize the image with the computed scale
-            image = (255.0 * skimage.transform.resize(image, (target_size, target_size))).astype(np.uint8)
-            image_next = (255.0 * skimage.transform.resize(image_next, (target_size, target_size))).astype(np.uint8)
-            annots[:, :4] *= (target_size / (crop_size * expand_ratio))
-            annots_next[:, :4] *= (target_size / (crop_size * expand_ratio))
-            #print('crop2',image.max())
-            return {'img': image, 'annot': annots, 'img_next': image_next, 'annot_next': annots_next}
-        if not crop_success:
-            image = (255.0 * skimage.transform.resize(image, (height // 2, width // 2))).astype(np.uint8)
-            image_next = (255.0 * skimage.transform.resize(image_next, (height // 2, width // 2))).astype(np.uint8)
-            annots[:, :4] *= 0.5
-            annots_next[:, :4] *= 0.5
         return {'img': image, 'annot': annots, 'img_next': image_next, 'annot_next': annots_next}
 
 
 class AspectRatioBasedSampler(Sampler):
-
     def __init__(self, data_source, batch_size, drop_last):
         self.data_source = data_source
         self.batch_size = batch_size
