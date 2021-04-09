@@ -5,7 +5,7 @@ import math
 import time
 import torch.utils.model_zoo as model_zoo
 import torch.nn.functional as F
-from utils import BasicBlock, Bottleneck, distance2bbox, bbox2distance, ClipBoxes
+from utils import BasicBlock, Bottleneck, distance2bbox, bbox2distance, maxpool_nms
 from anchors import Anchors
 from losses import FocalLoss, GiouLoss
 from lib.nms import cython_soft_nms_wrapper, nms
@@ -129,7 +129,8 @@ class FCOSTracker(nn.Module):
                  stride=None,
                  regress_range=((-1,64),(64,256),(256,1e8)),
                  margin = 2,
-                 pretrained=None):
+                 center_sampling=True,
+                 center_sampling_radius=3):
         super(FCOSTracker, self).__init__()
         self.backbone = build_backbone(**backbone)
         if neck is not None:
@@ -153,6 +154,8 @@ class FCOSTracker(nn.Module):
         self.test_cfg = test_cfg
         self.regress_range = regress_range
         self.margin = margin
+        self.center_sampling = center_sampling
+        self.center_sampling_radius = center_sampling_radius
         self.init_weights(backbone.get('pretrained',False))
 
     def init_weights(self,pretrained=False):
@@ -294,22 +297,52 @@ class FCOSTracker(nn.Module):
         bbox_targets = bbox2distance(points, gt_bboxes)
 
         stride = self.stride[0]
-        inside_gt_bbox_mask_margin = (bbox_targets[:, :, :2].max(-1)[0] < -self.margin*stride) & (bbox_targets[:, :, 2:].min(-1)[0] > self.margin*stride)
-        outside_gt_bbox_mask_margin = (bbox_targets[:, :, :2].max(-1)[0] < self.margin*stride) & (bbox_targets[:, :, 2:].min(-1)[0] > -self.margin*stride)
+        if self.center_sampling:
+            gt_bboxes = gt_bboxes[None].expand(num_points, num_gts, 4)
+            xs, ys = points[:, 0], points[:, 1]
+            xs = xs[:, None].expand(num_points, num_gts)
+            ys = ys[:, None].expand(num_points, num_gts)
+            # condition1: inside a `center bbox`
+            radius = self.center_sampling_radius
+            center_xs = (gt_bboxes[..., 0] + gt_bboxes[..., 2]) / 2
+            center_ys = (gt_bboxes[..., 1] + gt_bboxes[..., 3]) / 2
+            center_gts = torch.zeros_like(gt_bboxes)
+
+            x_mins = center_xs - radius*stride
+            y_mins = center_ys - radius*stride*2
+            x_maxs = center_xs + radius*stride
+            y_maxs = center_ys + radius*stride*2
+            center_gts[..., 0] = torch.where(x_mins > gt_bboxes[..., 0],
+                                             x_mins, gt_bboxes[..., 0])
+            center_gts[..., 1] = torch.where(y_mins > gt_bboxes[..., 1],
+                                             y_mins, gt_bboxes[..., 1])
+            center_gts[..., 2] = torch.where(x_maxs > gt_bboxes[..., 2],
+                                             gt_bboxes[..., 2], x_maxs)
+            center_gts[..., 3] = torch.where(y_maxs > gt_bboxes[..., 3],
+                                             gt_bboxes[..., 3], y_maxs)
+
+            cb_dist_left = xs - center_gts[..., 0]
+            cb_dist_right = center_gts[..., 2] - xs
+            cb_dist_top = ys - center_gts[..., 1]
+            cb_dist_bottom = center_gts[..., 3] - ys
+            center_bbox = torch.stack(
+                (cb_dist_left, cb_dist_top, cb_dist_right, cb_dist_bottom), -1)
+            inside_gt_bbox_mask = center_bbox.min(-1)[0] > 0
+        else:
+            inside_gt_bbox_mask = (bbox_targets[:, :, :2].max(-1)[0] < 0) & (bbox_targets[:, :, 2:].min(-1)[0] > 0)
         max_regress_distance = bbox_targets.abs().max(-1)[0]
         #min_regress_distance = bbox_targets.abs().min(-1)[0]
-        inside_regress_range = (
-                (max_regress_distance >= regress_ranges[..., 0][:,None])
-                & (max_regress_distance <= regress_ranges[..., 1][:,None]))
-        inside_mask = inside_gt_bbox_mask_margin #shape:(num_points, num_gts)
-        outside_mask = outside_gt_bbox_mask_margin
-        areas[inside_mask == 0] = -1
-        max_area, max_area_inds = areas.max(dim=1)
+        # inside_regress_range = (
+        #         (max_regress_distance >= regress_ranges[..., 0][:,None])
+        #         & (max_regress_distance <= regress_ranges[..., 1][:,None]))
+        inside_mask = inside_gt_bbox_mask #shape:(num_points, num_gts)
+        areas[inside_mask == 0] = 1e8
+        min_area, min_area_inds = areas.min(dim=1)
 
-        labels = gt_labels[max_area_inds]
-        ids = gt_ids[max_area_inds]
-        labels[max_area == -1] = self.background_class  # set as BG
-        ids[max_area == -1] = -1
+        labels = gt_labels[min_area_inds]
+        ids = gt_ids[min_area_inds]
+        labels[min_area == 1e8] = self.background_class  # set as BG
+        ids[min_area == 1e8] = -1
 
         #count id num
         # dic_ = {}
@@ -325,7 +358,7 @@ class FCOSTracker(nn.Module):
         # print(num_med)
 
         bbox_targets[~inside_mask] = 0  # ignore
-        bbox_targets = bbox_targets[range(num_points), max_area_inds]
+        bbox_targets = bbox_targets[range(num_points), min_area_inds]
 
         return labels, bbox_targets, ids
 
@@ -340,13 +373,17 @@ class FCOSTracker(nn.Module):
         for ind, featmap in enumerate(feats):
             track_features.append(torch.cat((last_feats[ind], featmap), dim=1))
         reg_features = []
-        cls_features = []
+        cls_scores = []
         mlvl_points = []
         for i, feature in enumerate(track_features):
             cls_feat = self.cls_head(feature)
             cls_feat = cls_feat.permute(0, 2, 3, 1)
             batch_size, height, width, _ = cls_feat.shape
             cls_feat = cls_feat.contiguous().view(batch_size, -1, self.num_classes)
+            score = cls_feat.softmax(dim=-1)
+            score, indices = torch.max(score, dim=-1, keepdim=True)
+            score[indices == self.background_class] = 0
+            score = maxpool_nms(score)
 
             reg_feat = self.reg_head(feature)
             reg_feat = reg_feat.permute(0, 2, 3, 1)
@@ -357,25 +394,20 @@ class FCOSTracker(nn.Module):
 
             mlvl_points.append(points)
             reg_features.append(reg_feat)
-            cls_features.append(cls_feat)
+            cls_scores.append(score)
         regression = torch.cat(reg_features, dim=1) #shape:(1, num_points, 8)
-        classification = torch.cat(cls_features, dim=1)
+        cls_scores = torch.cat(cls_scores, dim=1) #shape:(1, num_points, 1)
         mlvl_points = torch.cat(mlvl_points, dim=0)
 
-        #scores = torch.sigmoid(classification)
-        scores = torch.softmax(classification, dim=-1) #shape:(1, num_points, num_classes)
-
-        conf_feat = scores[0][:,0].view(feats[0].shape[-2],feats[0].shape[-1])
-
-        scores, indices = torch.max(scores, dim=-1, keepdim=True) #shape:(1, num_points, 1)
-        pos_indices = (indices != self.background_class) & (scores > 0.6)
+        conf_feat = cls_scores[0][:,0].view(feats[0].shape[-2],feats[0].shape[-1])
+        pos_indices = cls_scores > 0.6
         pos_indices = pos_indices[0, :, 0] #squeeze the batc_size dim(batch_size always is 1)
         pos_num = pos_indices.sum()
         if pos_num == 0:
             # no boxes to NMS, just return
             return torch.zeros(0), torch.zeros(0, 4), feats, conf_feat
 
-        scores = scores[..., pos_indices, :] #shape:(1, num_pos_points)
+        scores = cls_scores[..., pos_indices, :] #shape:(1, num_pos_points)
         mlvl_points = mlvl_points[pos_indices] #shape:(num_pos_points, 2)
         regression = regression[..., pos_indices, :] #shape:(1, num_pos_points, 8)
 
@@ -383,8 +415,8 @@ class FCOSTracker(nn.Module):
         bboxes_2 = distance2bbox(mlvl_points, regression[...,4:])
         bboxes = torch.cat([bboxes_1,bboxes_2],dim=-1)
         final_bboxes, index = cython_soft_nms_wrapper(0.7, method='gaussian')(
-           torch.cat([bboxes.contiguous(), scores], dim=2)[0].cpu().numpy())
-        #final_bboxes, index = nms(torch.cat([bboxes.contiguous(), scores], dim=2)[0].cpu().numpy(),0.5)
+           torch.cat([bboxes.contiguous(), cls_scores], dim=2)[0].cpu().numpy())
+        #final_bboxes, index = nms(torch.cat([bboxes.contiguous(), cls_scores], dim=2)[0].cpu().numpy(),0.5)
 
         return final_bboxes[:, -1], final_bboxes, feats, conf_feat
 

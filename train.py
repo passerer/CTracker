@@ -26,7 +26,6 @@ from torchvision import datasets, models, transforms
 import torchvision
 
 import model
-from test import run_from_train
 from dataloader import CSVDataset, collater, RandomFlip, AspectRatioBasedSampler, RandomResize, Normalizer, PhotometricDistort, RandomSampleCrop
 from torch.utils.data import Dataset, DataLoader
 
@@ -92,9 +91,9 @@ def main(args=None):
 
     fcosTracker.training = True
 
-    optimizer = optim.Adam(fcosTracker.parameters(), lr=1*1e-3)
+    optimizer = optim.Adam(fcosTracker.parameters(), lr=1*1e-4)
 
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2, verbose=True)
 
     loss_hist = collections.deque(maxlen=500)
 
@@ -143,7 +142,6 @@ def main(args=None):
 
     fcosTracker.eval()
     torch.save(fcosTracker, os.path.join(parser.model_dir, 'ChainTracker_{}.pt'.format(parser.epochs)))
-    #run_from_train(parser.model_dir, parser.root_path)
 
 if __name__ == '__main__':
     main()

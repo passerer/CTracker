@@ -173,6 +173,14 @@ def bbox2distance(points, bboxes):
     bbox_targets = torch.stack((left, top, right, bottom), -1)
     return bbox_targets
 
+def maxpool_nms(heat, kernel=3):
+    pad = (kernel - 1) // 2
+
+    hmax = nn.functional.max_pool2d(
+        heat, (kernel, kernel), stride=1, padding=pad)
+    keep = (hmax == heat).float()
+    return heat * keep
+
 class ClipBoxes(nn.Module):
 
     def __init__(self, width=None, height=None):

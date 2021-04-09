@@ -301,23 +301,6 @@ def run_each_dataset(model_dir, FcosTracker, dataset_path, subset, cur_dataset, 
         if parser.save_video:
             videoWriter.release()
 
-def run_from_train(model_dir, root_path):
-    if not os.path.exists(os.path.join(model_dir, 'results')):
-        os.makedirs(os.path.join(model_dir, 'results'))
-    retinanet = torch.load(os.path.join(model_dir, 'model_final.pt'))
-
-    use_gpu = torch.cuda.is_available()
-    print('use gpu:', use_gpu)
-
-    if use_gpu: retinanet = retinanet.cuda()
-
-    retinanet.eval()
-
-    for seq_num in [2, 4, 5, 9, 10, 11, 13]:
-        run_each_dataset(model_dir, retinanet, root_path, 'train', 'MOT17-{:02d}'.format(seq_num))
-    for seq_num in [1, 3, 6, 7, 8, 12, 14]:
-        run_each_dataset(model_dir, retinanet, root_path, 'test', 'MOT17-{:02d}'.format(seq_num))
-
 def eval_metrics(gt_root, dt_root):
     os.system('/home/chenchao/miniconda3/envs/py36/bin/python eval_motchallenge.py ' + \
               ' {} '.format(gt_root) + \

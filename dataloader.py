@@ -542,7 +542,7 @@ class Compose(object):
 
 
 class RandomResize(object):
-    def __init__(self, resize_range=(0.3, 1.0)):
+    def __init__(self, resize_range=(0.7, 1.5)):
         self.resize_range=resize_range
         assert isinstance(resize_range, tuple) and resize_range[0] < resize_range[1]
 
@@ -565,7 +565,7 @@ class RandomResize(object):
 
 
 class RandomSampleCrop(object):
-    def __init__(self, min_iou=0.5, crop_range=(0.3, 0.9)):
+    def __init__(self, min_iou=0.25, crop_range=(0.3, 0.9)):
         self.min_iou = min_iou
         self.crop_range = crop_range
         assert isinstance(crop_range, tuple) and crop_range[0]<crop_range[1]
