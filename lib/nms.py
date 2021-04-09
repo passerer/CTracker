@@ -1,5 +1,5 @@
 import numpy as np
-from .cython_nms.cpu_nms import greedy_nms, soft_nms
+#from .cython_nms.cpu_nms import greedy_nms, soft_nms
 
 def cython_soft_nms_wrapper(thresh, sigma=0.5, score_thresh=0.001, method='linear'):
     methods = {'hard': 0, 'linear': 1, 'gaussian': 2}
