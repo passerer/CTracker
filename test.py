@@ -15,8 +15,6 @@ from scipy.optimize import linear_sum_assignment
 
 #assert torch.__version__.split('.')[1] == '4'
 
-print('CUDA available: {}'.format(torch.cuda.is_available()))
-
 color_list = [(0, 0, 255), (255, 0, 0), (0, 255, 0), (255, 0, 255), (0, 255, 255), (255, 255, 0), (128, 0, 255),
               (0, 128, 255), (128, 255, 0), (0, 255, 128), (255, 128, 0), (255, 0, 128), (128, 128, 255),
               (128, 255, 128), (255, 128, 128), (128, 128, 0), (128, 0, 128)]
@@ -138,8 +136,6 @@ def draw_caption(image, box, caption, color):
 
 
 def run_each_dataset(model_dir, FcosTracker, dataset_path, subset, cur_dataset, parser):
-    print('run ',cur_dataset)
-
     img_list = os.listdir(os.path.join(dataset_path, subset, cur_dataset, 'img1'))
     img_list = [os.path.join(dataset_path, subset, cur_dataset, 'img1', _) for _ in img_list if
                 ('jpg' in _) or ('png' in _)]
@@ -159,6 +155,7 @@ def run_each_dataset(model_dir, FcosTracker, dataset_path, subset, cur_dataset, 
     draw_interval = 5
     img_width = 1920
     img_height = 1080
+    resize_scale = 1.0
     fps = 6
 
     if parser.show_conf:
@@ -167,16 +164,17 @@ def run_each_dataset(model_dir, FcosTracker, dataset_path, subset, cur_dataset, 
     for i in range(img_len):
         det_list_all.append([])
 
-    for idx in tqdm(range(img_len + 1)):
-    #for idx in tqdm(range(10)):
+    pbar = tqdm(range(img_len+1))
+    for idx in pbar:
+        pbar.set_description('run {}'.format(cur_dataset))
         i = idx - 1
         with torch.no_grad():
             data_path1 = img_list[min(idx, img_len - 1)]
             img_origin1 = skimage.io.imread(data_path1)
             img_h, img_w, _ = img_origin1.shape
             img_height, img_width = img_h, img_w
-            resize_h = img_height
-            resize_w = int(img_w/img_h*resize_h)
+            resize_h = int(img_height*resize_scale)
+            resize_w = int(img_w*resize_scale)
             resize_h, resize_w = math.ceil(resize_h / 32) * 32, math.ceil(resize_w / 32) * 32
             img1 = (255.0 * skimage.transform.resize(img_origin1, (resize_h, resize_w))).astype(np.uint8)
             img1 = (img1.astype(np.float32) / 255.0 - np.array([[RGB_MEAN]])) / np.array([[RGB_STD]])
@@ -245,9 +243,8 @@ def run_each_dataset(model_dir, FcosTracker, dataset_path, subset, cur_dataset, 
                     tracklet_all.append(track)
 
     # **************visualize tracking result and save evaluate file****************
-    print('save {} result'.format(cur_dataset))
     fout_tracking = open(os.path.join(model_dir, 'results', cur_dataset + '.txt'), 'w')
-    for i in tqdm(range(img_len)):
+    for i in range(img_len):
     #for i in tqdm(range(10)):
         for j in range(len(det_list_all[i])):
             x1, y1, x2, y2 = det_list_all[i][j].curr_rect.astype(int)
@@ -266,8 +263,7 @@ def run_each_dataset(model_dir, FcosTracker, dataset_path, subset, cur_dataset, 
             if not os.path.exists(save_img_dir):
                 os.makedirs(save_img_dir)
         id_dict = {}
-        print('visualize {} result'.format(cur_dataset))
-        for i in tqdm(range(img_len)):
+        for i in range(img_len):
         #for i in tqdm(range(10)):
             img = cv2.imread(img_list[i])
 
@@ -319,26 +315,39 @@ def main():
     parser.add_argument('--save_video', action='store_true', help='Whether to visulize results as video format.')
     parser.add_argument('--save_image', action='store_true', help='Whether to visulize results as image format.')
     parser.add_argument('--show_conf', action='store_true', help='Show predict confidence heatmap.')
+    parser.add_argument('--multi_test', action='store_true', help='Whether use torch.multiprocessing.')
     parser = parser.parse_args()
 
     if not os.path.exists(os.path.join(parser.model_dir, 'results')):
         os.makedirs(os.path.join(parser.model_dir, 'results'))
 
     FcosTracker = torch.load(os.path.join(parser.model_dir, parser.model_name))
-    if isinstance(FcosTracker,torch.nn.DataParallel):
+    if isinstance(FcosTracker, torch.nn.DataParallel):
         FcosTracker = FcosTracker.module
     use_gpu = True
-
     if use_gpu: FcosTracker = FcosTracker.cuda()
-
     FcosTracker.eval()
 
+    if parser.multi_test:
+        FcosTracker.share_memory()
+        torch.multiprocessing.set_start_method('spawn')
+        processes = []
+
     for seq_num in [2, 4, 5, 9, 10, 11, 13]:
-    #for seq_num in [2]:
-        run_each_dataset(parser.model_dir, FcosTracker, parser.dataset_path, 'train', 'MOT17-{:02d}'.format(seq_num), parser)
+        if parser.multi_test:
+            p = torch.multiprocessing.Process(target=run_each_dataset, args=(parser.model_dir, FcosTracker, parser.dataset_path, 'train', 'MOT17-{:02d}'.format(seq_num), parser))
+            p.start()
+            processes.append(p)
+        else:
+            run_each_dataset(parser.model_dir, FcosTracker, parser.dataset_path, 'train', 'MOT17-{:02d}'.format(seq_num), parser)
+    if parser.multi_test:
+        for p in processes:
+            p.join()
+
     if parser.use_test_dataset:
         for seq_num in [1, 3, 6, 7, 8, 12, 14]:
             run_each_dataset(parser.model_dir, FcosTracker, parser.dataset_path, 'test', 'MOT17-{:02d}'.format(seq_num), parser)
+
     eval_metrics(os.path.join(parser.dataset_path,'train'),os.path.join(parser.model_dir,'results'))
 
 if __name__ == '__main__':

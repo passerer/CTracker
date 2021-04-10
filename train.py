@@ -9,6 +9,7 @@ import os
 import collections
 import sys
 import random
+from tqdm import tqdm
 random.seed(random_seed)
 import numpy as np
 np.random.seed(random_seed)
@@ -106,7 +107,6 @@ def main(args=None):
 
         fcosTracker.train()
         epoch_loss = []
-
         for iter_num, data in enumerate(dataloader_train):
             total_iter = total_iter + 1
             optimizer.zero_grad()
@@ -127,7 +127,7 @@ def main(args=None):
 
             loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(fcosTracker.parameters(), 1.)
+            torch.nn.utils.clip_grad_norm_(fcosTracker.parameters(), 0.1)
 
             optimizer.step()
 
@@ -136,7 +136,7 @@ def main(args=None):
 
             if iter_num % parser.show_interval == 0:
                 print(fcosTracker.module.reg_scale.data)
-                print('Epoch: {} | Iter: {} | Cls loss: {:1.5f}  | Reg loss: {:1.5f} | Running loss: {:1.5f}'.format(epoch_num, iter_num, float(classification_loss), float(regression_loss), np.mean(loss_hist)))
+                print('Epoch: {} | Iter: {} | Cls loss: {:1.3f}  | Reg loss: {:1.3f} | Running loss: {:1.3f}'.format(epoch_num, iter_num, float(classification_loss), float(regression_loss), np.mean(loss_hist)))
 
         if (epoch_num+1) % parser.save_interval == 0:
             torch.save(fcosTracker, os.path.join(parser.model_dir, 'ChainTracker_{}.pt'.format(epoch_num)))

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from utils import BasicBlock, Bottleneck, distance2bbox, bbox2distance, maxpool_nms
 from anchors import Anchors
 from losses import FocalLoss, GiouLoss
-from lib.nms import nms
+from lib.nms import cython_soft_nms_wrapper, nms
 
 
 model_urls = {
@@ -64,7 +64,7 @@ class FPN(nn.Module):
         assert len(inputs) == len(self.in_channels)
         laterals = [lateral_conv(inputs[i]) for i, lateral_conv in enumerate(self.lateral_convs)]
         for i in range(len(inputs)-1, 0, -1):
-            laterals[i-1] += F.interpolate(laterals[i], scale_factor=2, mode='bilinear')
+            laterals[i-1] += F.interpolate(laterals[i], scale_factor=2, mode='bilinear',align_corners=True)
         fpn_outputs = [self.fpn_convs[i](laterals[i]) for i in self.out_indices]
         return fpn_outputs
 
@@ -407,16 +407,16 @@ class FCOSTracker(nn.Module):
             # no boxes to NMS, just return
             return torch.zeros(0), torch.zeros(0, 4), feats, conf_feat
 
-        scores = cls_scores[..., pos_indices, :] #shape:(1, num_pos_points)
+        cls_scores = cls_scores[..., pos_indices, :] #shape:(1, num_pos_points)
         mlvl_points = mlvl_points[pos_indices] #shape:(num_pos_points, 2)
         regression = regression[..., pos_indices, :] #shape:(1, num_pos_points, 8)
 
         bboxes_1 = distance2bbox(mlvl_points, regression[...,:4])
         bboxes_2 = distance2bbox(mlvl_points, regression[...,4:])
         bboxes = torch.cat([bboxes_1,bboxes_2],dim=-1)
-        # final_bboxes, index = cython_soft_nms_wrapper(0.7, method='gaussian')(
-        #    torch.cat([bboxes.contiguous(), cls_scores], dim=2)[0].cpu().numpy())
-        final_bboxes, index = nms(torch.cat([bboxes.contiguous(), cls_scores], dim=2)[0].cpu().numpy(),0.5)
+        final_bboxes, index = cython_soft_nms_wrapper(0.7, method='gaussian')(
+           torch.cat([bboxes.contiguous(), cls_scores], dim=2)[0].cpu().numpy())
+        #final_bboxes, index = nms(torch.cat([bboxes.contiguous(), cls_scores], dim=2)[0].cpu().numpy(),0.5)
 
         return final_bboxes[:, -1], final_bboxes, feats, conf_feat
 
