@@ -3,21 +3,15 @@ import torch.nn as nn
 import torch
 import math
 import time
-import torch.utils.model_zoo as model_zoo
+
 import torch.nn.functional as F
-from utils import BasicBlock, Bottleneck, distance2bbox, bbox2distance, maxpool_nms
-from anchors import Anchors
+from utils import  distance2bbox, bbox2distance, maxpool_nms
 from losses import FocalLoss, GiouLoss
 from lib.nms import cython_soft_nms_wrapper, nms
+from ResNet import build_resnet, ResNet
+from RepVgg import build_repvgg
 
 
-model_urls = {
-    'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',
-    'resnet34': 'https://download.pytorch.org/models/resnet34-333f7ec4.pth',
-    'resnet50': 'https://download.pytorch.org/models/resnet50-19c8e357.pth',
-    'resnet101': 'https://download.pytorch.org/models/resnet101-5d3b4d8f.pth',
-    'resnet152': 'https://download.pytorch.org/models/resnet152-b121ed2d.pth',
-}
 
 class ConvModule(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, with_bn=True, **kwargs):
@@ -105,14 +99,10 @@ class CNNHead(nn.Module):
 
 
 def build_backbone(name, pretrained=False, **kwargs):
-    if name == "resnet18":
-        return resnet18(pretrained)
-    elif name == "resnet34":
-        return resnet34(pretrained)
-    elif name == "resnet50":
-        return resnet50(pretrained)
-    elif name == "resnet101":
-        return resnet101()
+    if 'resnet' in name:
+        return build_resnet(name, pretrained=pretrained, **kwargs)
+    elif 'RepVGG' in name:
+        return build_repvgg(name, pretrained=pretrained, **kwargs)
     else:
         raise NotImplementedError
 
@@ -130,7 +120,9 @@ class FCOSTracker(nn.Module):
                  regress_range=((-1,64),(64,256),(256,1e8)),
                  margin = 2,
                  center_sampling=True,
-                 center_sampling_radius=3):
+                 center_sampling_radius=3,
+                 cls_attention=False,
+                 use_stride_channel=True):
         super(FCOSTracker, self).__init__()
         self.backbone = build_backbone(**backbone)
         if neck is not None:
@@ -141,7 +133,11 @@ class FCOSTracker(nn.Module):
         self.reg_head = CNNHead(**reg_head)
         self.num_classes = cls_head.get('out_channels', 2) #include BG.
         self.background_class = self.num_classes -1
-        self.reg_channels = reg_head.get('out_channels', 8)
+        self.use_stride_channel = use_stride_channel
+        if not use_stride_channel:
+            self.reg_channels = reg_head.get('out_channels', 8)
+        else:
+            self.reg_channels = reg_head.get('out_channels', 9)
         self.cls_ignore_index = cls_head.get('ignore_index', -1)
         self.reg_ignore_index = reg_head.get('ignore_index', 0)
         #self.cls_loss = nn.CrossEntropyLoss(ignore_index=self.cls_ignore_index)
@@ -150,12 +146,14 @@ class FCOSTracker(nn.Module):
         self.reg_loss = nn.SmoothL1Loss()
         self.stride = stride
         self.reg_scale = nn.Parameter(torch.tensor([math.log(stride) for stride in self.stride], dtype=torch.float)) #A learnable scale parameter.
+        self.loss_scale = torch.nn.Parameter(torch.tensor([0.33,3.33],dtype=torch.float))
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
         self.regress_range = regress_range
         self.margin = margin
         self.center_sampling = center_sampling
         self.center_sampling_radius = center_sampling_radius
+        self.cls_attention = cls_attention
         self.init_weights(backbone.get('pretrained',False))
 
     def init_weights(self,pretrained=False):
@@ -184,12 +182,13 @@ class FCOSTracker(nn.Module):
         else:
             return (x,)
 
+    def freeze_backbone_bn(self):
+        self.backbone.freeze_bn()
+
     def forward_dummy(self, img):
         """Used for computing network flops.
         """
-        x = self.extract_feat(img)
-        outs = self.cls_head(x) + self.reg_head(x)
-        return outs
+        raise NotImplementedError
 
     def forward(self, inputs, train_mode, **kwargs):
         if train_mode:
@@ -214,14 +213,22 @@ class FCOSTracker(nn.Module):
         regress_ranges = []
         for i, feature in enumerate(track_features):
             cls_feat = self.cls_head(feature)
+            if self.cls_attention:
+                reg_in = feature*(1-torch.softmax(cls_feat,dim=1)[:,self.background_class])
+            else:
+                reg_in = feature
+            reg_feat = self.reg_head(reg_in)
+
             cls_feat = cls_feat.permute(0, 2, 3, 1)
             batch_size, height, width, _ = cls_feat.shape
             cls_feat = cls_feat.contiguous().view(batch_size, -1, self.num_classes)
 
-            reg_feat = self.reg_head(feature)
             reg_feat = reg_feat.permute(0, 2, 3, 1)
             reg_feat = reg_feat.contiguous().view(batch_size, -1, self.reg_channels)
-            reg_feat = reg_feat*torch.exp(self.reg_scale[i])
+            if not self.use_stride_channel:
+                reg_feat = reg_feat*torch.exp(self.reg_scale[i])
+            else:
+                reg_feat = reg_feat[..., :8]*torch.exp(reg_feat[..., 8:])
 
             points = self.get_points(width, height, self.stride[i], reg_feat[0].dtype, reg_feat[0].device)
 
@@ -344,7 +351,7 @@ class FCOSTracker(nn.Module):
         labels[min_area == 1e8] = self.background_class  # set as BG
         ids[min_area == 1e8] = -1
 
-        #count id num
+        # #count id num
         # dic_ = {}
         # for id in ids:
         #     a = id.cpu().item()
@@ -354,8 +361,8 @@ class FCOSTracker(nn.Module):
         #         dic_[a]=1
         #     else:
         #         dic_[a] +=1
-        # num_med = int(np.median(dic_.values()))
-        # print(num_med)
+        # num_med = int(np.median(list(dic_.values())))
+        # print(dic_.values(),num_med)
 
         bbox_targets[~inside_mask] = 0  # ignore
         bbox_targets = bbox_targets[range(num_points), min_area_inds]
@@ -377,18 +384,26 @@ class FCOSTracker(nn.Module):
         mlvl_points = []
         for i, feature in enumerate(track_features):
             cls_feat = self.cls_head(feature)
+            if self.cls_attention:
+                reg_in = feature * (1 - torch.softmax(cls_feat, dim=1)[:,self.background_class])
+            else:
+                reg_in = feature
+            reg_feat = self.reg_head(reg_in)
+
             cls_feat = cls_feat.permute(0, 2, 3, 1)
             batch_size, height, width, _ = cls_feat.shape
             cls_feat = cls_feat.contiguous().view(batch_size, -1, self.num_classes)
             score = cls_feat.softmax(dim=-1)
             score, indices = torch.max(score, dim=-1, keepdim=True)
             score[indices == self.background_class] = 0
-            score = maxpool_nms(score)
+            score = maxpool_nms(score,kernel=5)
 
-            reg_feat = self.reg_head(feature)
             reg_feat = reg_feat.permute(0, 2, 3, 1)
             reg_feat = reg_feat.contiguous().view(batch_size, -1, self.reg_channels)
-            reg_feat = reg_feat * torch.exp(self.reg_scale[i])
+            if not self.use_stride_channel:
+                reg_feat = reg_feat*torch.exp(self.reg_scale[i])
+            else:
+                reg_feat = reg_feat[..., :8]*torch.exp(reg_feat[..., 8:])
 
             points = self.get_points(width, height, self.stride[i], reg_feat[0].dtype, reg_feat[0].device)
 
@@ -420,118 +435,3 @@ class FCOSTracker(nn.Module):
 
         return final_bboxes[:, -1], final_bboxes, feats, conf_feat
 
-class ResNet(nn.Module):
-
-    def __init__(self, block, layers):
-        self.inplanes = 64
-        super(ResNet, self).__init__()
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = self._make_layer(block, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
-
-        #self.freeze_bn()
-
-    def _make_layer(self, block, planes, blocks, stride=1):
-        downsample = None
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                nn.Conv2d(self.inplanes, planes * block.expansion,
-                          kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(planes * block.expansion),
-            )
-
-        layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample))
-        self.inplanes = planes * block.expansion
-        for i in range(1, blocks):
-            layers.append(block(self.inplanes, planes))
-
-        return nn.Sequential(*layers)
-    def init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-                m.weight.data.normal_(0, math.sqrt(2. / n))
-            elif isinstance(m, nn.BatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
-
-    def freeze_bn(self):
-        '''Freeze BatchNorm layers.'''
-        for layer in self.modules():
-            if isinstance(layer, nn.BatchNorm2d):
-                layer.eval()
-
-    def forward(self, x):
-            
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-
-        x1 = self.layer1(x)
-        x2 = self.layer2(x1)
-        x3 = self.layer3(x2)
-        x4 = self.layer4(x3)
-
-        return (x2, x3, x4)
-
-
-def resnet18(pretrained=False, **kwargs):
-    """Constructs a ResNet-18 model.
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-    """
-    model = ResNet(BasicBlock, [2, 2, 2, 2], **kwargs)
-    if pretrained:
-        path = model_urls['resnet18']
-        model.load_state_dict(model_zoo.load_url(path), strict=False)
-    return model
-
-
-def resnet34(pretrained=False, **kwargs):
-    """Constructs a ResNet-34 model.
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-    """
-    model = ResNet(BasicBlock, [3, 4, 6, 3], **kwargs)
-    if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet34']), strict=False)
-    return model
-
-
-def resnet50(pretrained=False, **kwargs):
-    """Constructs a ResNet-50 model.
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-    """
-    model = ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
-    if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet50']), strict=False)
-    return model
-
-def resnet101(pretrained=False, **kwargs):
-    """Constructs a ResNet-101 model.
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-    """
-    model = ResNet(Bottleneck, [3, 4, 23, 3], **kwargs)
-    if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet101']), strict=False)
-    return model
-
-
-def resnet152(pretrained=False, **kwargs):
-    """Constructs a ResNet-152 model.
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-    """
-    model = ResNet(Bottleneck, [3, 8, 36, 3], **kwargs)
-    if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet152']), strict=False)
-    return model

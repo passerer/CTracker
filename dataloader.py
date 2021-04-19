@@ -1,14 +1,14 @@
 from __future__ import print_function, division
-import sys
+import copy
 import os
 import torch
 import numpy as np
 import random
-import cv2
+import json
 import csv
 from six import raise_from
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, utils
+import torch.nn.functional as F
 from torch.utils.data.sampler import Sampler
 
 import skimage.io
@@ -20,55 +20,41 @@ from PIL import Image, ImageEnhance
 RGB_MEAN = [0.485, 0.456, 0.406]
 RGB_STD = [0.229, 0.224, 0.225]
 
-class CSVDataset(Dataset):
-    """CSV dataset."""
+class MOTDataset(Dataset):
+    """CoCo dataset."""
 
-    def __init__(self, root_path, train_file, class_list, transform=None):
+    def __init__(self, root_path, train_file, transform=None):
         """
         Args:
-            train_file (string): CSV file with training annotations
-            annotations (string): CSV file with class list
-            test_file (string, optional): CSV file with testing annotations
+
         """
+        super(MOTDataset, self).__init__()
         self.train_file = train_file
-        self.class_list = class_list
         self.transform = transform
         self.root_path = root_path
-        # parse the provided class file
-        try:
-            with self._open_for_csv(self.class_list) as file:
-                self.classes = self.load_classes(csv.reader(file, delimiter=','))
-        except ValueError as e:
-            raise_from(ValueError('invalid CSV class file: {}: {}'.format(self.class_list, e)), None)
 
-        self.labels = {}
-        for key, value in self.classes.items():
-            self.labels[value] = key
+        # load annotations
+        print('loading annotations into memory')
+        with open(self.train_file, 'r') as fr:
+            coco_json = json.load(fr)
+        assert type(coco_json) == dict, 'annotation file format {} not supported'.format(type(coco_json))
+        self.classes = coco_json['categories']
+        self.image_data = self._read_annotations(coco_json)
 
-        # csv with img_path, obj_id, x1, y1, x2, y2, class_name
-        try:
-            with self._open_for_csv(self.train_file) as file:
-                self.image_data = self._read_annotations(csv.reader(file, delimiter=','), self.classes)
-        except ValueError as e:
-            raise_from(ValueError('invalid CSV annotations file: {}: {}'.format(self.train_file, e)), None)
         self.image_names = list(self.image_data.keys())
         self.name2video_frames = dict()
         self.image_name_prefix = list()
         for image_name in self.image_names:
             self.image_name_prefix.append(image_name[0:-len(image_name.split('/')[-1].split('_')[-1])])
         self.image_name_prefix = set(self.image_name_prefix)
-        print('total vedio count: {}'.format(len(self.image_name_prefix)))
+        print('total video count: {}'.format(len(self.image_name_prefix)))
         for image_name in self.image_names:
-            cur_prefix = image_name[0:-len(image_name.split('/')[-1].split('_')[-1])]
+            cur_prefix = image_name[0:-len(image_name.split('/')[-1])]
             if cur_prefix not in self.name2video_frames:
                 self.name2video_frames[cur_prefix] = 1
             else:
-                self.name2video_frames[cur_prefix] = self.name2video_frames[cur_prefix] + 1
+                self.name2video_frames[cur_prefix] += 1
 
-    def _extract_frame_index(self, image_name):
-        suffix_name = image_name.split('/')[-1].split('_')[-1]
-        return int(float(suffix_name.split('.')[0]))
-    
     def _get_random_surroud_name(self, image_name, max_diff=3, ignore_equal=True, pos_only=True):
         suffix_name = image_name.split('/')[-1].split('_')[-1]
         prefix = image_name[0:-len(suffix_name)]
@@ -79,65 +65,20 @@ class CSVDataset(Dataset):
         while True:
             range_low = max(1, cur_index - max_diff)
             range_high = min(cur_index + max_diff, total_number)
-            if pos_only: 
+            if pos_only:
                 range_low = cur_index
                 if ignore_equal:
                     range_low = range_low + 1
                     if cur_index == total_number:
                         return image_name
-        
+
             next_index = random.randint(range_low, range_high)
             if ignore_equal:
                 if next_index == cur_index:
                     continue
             break
-        
+
         return prefix + '{0:06}.'.format(next_index) + suffix_name.split('.')[-1]
-
-    def _extract_name_prefix(self, image_name):
-        return image_name[0:-len(image_name.split('/')[-1].split('_')[-1])]
-
-    def _parse(self, value, function, fmt):
-        """
-        Parse a string into a value, and format a nice ValueError if it fails.
-        Returns `function(value)`.
-        Any `ValueError` raised is catched and a new `ValueError` is raised
-        with message `fmt.format(e)`, where `e` is the caught `ValueError`.
-        """
-        try:
-            return function(value)
-        except ValueError as e:
-            raise_from(ValueError(fmt.format(e)), None)
-
-    def _open_for_csv(self, path):
-        """
-        Open a file with flags suitable for csv.reader.
-        This is different for python2 it means with mode 'rb',
-        for python3 this means 'r' with "universal newlines".
-        """
-        if sys.version_info[0] < 3:
-            return open(path, 'rb')
-        else:
-            return open(path, 'r', newline='')
-
-
-    def load_classes(self, csv_reader):
-        result = {}
-
-        for line, row in enumerate(csv_reader):
-            line += 1
-
-            try:
-                class_name, class_id = row
-            except ValueError:
-                raise_from(ValueError('line {}: format should be \'class_name,class_id\''.format(line)), None)
-            class_id = self._parse(class_id, int, 'line {}: malformed class ID: {{}}'.format(line))
-
-            if class_name in result:
-                raise ValueError('line {}: duplicate class name: \'{}\''.format(line, class_name))
-            result[class_name] = class_id
-        return result
-
 
     def __len__(self):
         return len(self.image_names)
@@ -147,15 +88,15 @@ class CSVDataset(Dataset):
             try:
                 img = self.load_image(idx)
                 next_name = self._get_random_surroud_name(self.image_names[idx])
-                img_next = self.load_image_by_name(next_name)
+                img_next = self.load_image(next_name)
                 annot = self.load_annotations(idx)
-                annot_next = self.load_annotationse_by_name(next_name)
+                annot_next = self.load_annotations(next_name)
 
                 if (annot.shape[0] < 1) or (annot_next.shape[0] < 1):
                     idx = random.randrange(0, len(self.image_names))
                     continue
             except FileNotFoundError:
-                print ('FileNotFoundError in process image.')
+                print('FileNotFoundError in process image.')
                 idx = random.randrange(0, len(self.image_names))
                 continue
             break
@@ -169,26 +110,30 @@ class CSVDataset(Dataset):
 
         return sample
 
-    def load_image_by_name(self, image_name):
-        img = skimage.io.imread(image_name)
+
+    def load_image(self, image_index_or_name):
+        if isinstance(image_index_or_name, int):
+            img = skimage.io.imread(self.image_names[image_index_or_name])
+        elif isinstance(image_index_or_name, str):
+            img = skimage.io.imread(image_index_or_name)
+        else:
+            raise ValueError('Expected int or str, but get {}'.format(type(image_index_or_name)))
 
         if len(img.shape) == 2:
             img = skimage.color.gray2rgb(img)
 
         return img
 
-    def load_image(self, image_index):
-        img = skimage.io.imread(self.image_names[image_index])
-
-        if len(img.shape) == 2:
-            img = skimage.color.gray2rgb(img)
-
-        return img
-
-    def load_annotationse_by_name(self, image_name):
+    def load_annotations(self, image_index_or_name):
         # get ground truth annotations
-        annotation_list = self.image_data[image_name]
-        annotations     = np.zeros((0, 6))
+        if isinstance(image_index_or_name, int):
+            annotation_list = self.image_data[self.image_names[image_index_or_name]]
+        elif isinstance(image_index_or_name, str):
+            annotation_list = self.image_data[image_index_or_name]
+        else:
+            raise ValueError('Expected int or str, but get {}'.format(type(image_index_or_name)))
+
+        annotations = np.zeros((0, 6))
 
         # some images appear to miss annotations (like image with id 257034)
         if len(annotation_list) == 0:
@@ -202,100 +147,39 @@ class CSVDataset(Dataset):
             y1 = a['y1']
             y2 = a['y2']
             obj_id = a['obj_id']
+            category_id = a['class']
+            if category_id > 0:
+                category_id -= 1
 
-            if (x2-x1) < 1 or (y2-y1) < 1:
+            if (x2 - x1) < 1 or (y2 - y1) < 1:
                 continue
 
-            annotation        = np.zeros((1, 6))
-            
+            annotation = np.zeros((1, 6))
+
             annotation[0, 0] = x1
             annotation[0, 1] = y1
             annotation[0, 2] = x2
             annotation[0, 3] = y2
 
-            annotation[0, 4]  = self.name_to_label(a['class'])
-            annotation[0, 5]  = obj_id
-            annotations       = np.append(annotations, annotation, axis=0)
+            annotation[0, 4] = category_id
+            annotation[0, 5] = obj_id
+            annotations = np.append(annotations, annotation, axis=0)
 
         return annotations
 
-    def load_annotations(self, image_index):
-        # get ground truth annotations
-        annotation_list = self.image_data[self.image_names[image_index]]
-        annotations     = np.zeros((0, 6))
-
-        # some images appear to miss annotations (like image with id 257034)
-        if len(annotation_list) == 0:
-            return annotations
-
-        # parse annotations
-        for idx, a in enumerate(annotation_list):
-            # some annotations have basically no width / height, skip them
-            x1 = a['x1']
-            x2 = a['x2']
-            y1 = a['y1']
-            y2 = a['y2']
-            obj_id = a['obj_id']
-
-            if (x2-x1) < 1 or (y2-y1) < 1:
-                continue
-
-            annotation        = np.zeros((1, 6))
-            
-            annotation[0, 0] = x1
-            annotation[0, 1] = y1
-            annotation[0, 2] = x2
-            annotation[0, 3] = y2
-
-            annotation[0, 4]  = self.name_to_label(a['class'])
-            annotation[0, 5]  = obj_id
-
-            annotations       = np.append(annotations, annotation, axis=0)
-
-        return annotations
-
-    def _read_annotations(self, csv_reader, classes):
+    def _read_annotations(self, coco_json):
         result = {}
-        for line, row in enumerate(csv_reader):
-            line += 1
-
-            try:
-                img_file, obj_id, x1, y1, x2, y2, class_name = row[:7]
-            except ValueError:
-                raise_from(ValueError('line {}: format should be \'img_file,obj_id,x1,y1,x2,y2,class_name\' or \'img_file,,,,,\''.format(line)), None)
-
-            img_file = os.path.join(self.root_path, img_file.strip())
-            if img_file not in result:
-                result[img_file] = []
-            class_name = class_name.strip()
-
-            # If a row contains only an image path, it's an image without annotations.
-            if (x1, y1, x2, y2, class_name) == ('', '', '', '', ''):
-                continue
-
-            x1 = self._parse(float(x1), int, 'line {}: malformed x1: {{}}'.format(line))
-            y1 = self._parse(float(y1), int, 'line {}: malformed y1: {{}}'.format(line))
-            x2 = self._parse(float(x2), int, 'line {}: malformed x2: {{}}'.format(line))
-            y2 = self._parse(float(y2), int, 'line {}: malformed y2: {{}}'.format(line))
-
-            # Check that the bounding box is valid.
-            if x2 <= x1:
-                raise ValueError('line {}: x2 ({}) must be higher than x1 ({})'.format(line, x2, x1))
-            if y2 <= y1:
-                raise ValueError('line {}: y2 ({}) must be higher than y1 ({})'.format(line, y2, y1))
-
-            # check if the current class name is correctly present
-            if class_name not in classes:
-                raise ValueError('line {}: unknown class name: \'{}\' (classes: {})'.format(line, class_name, classes))
-
-            result[img_file].append({'x1': x1, 'x2': x2, 'y1': y1, 'y2': y2, 'class': class_name, 'obj_id': obj_id})
+        img_id2path = {}
+        for img in coco_json['images']:
+            img_full_path = os.path.join(self.root_path, img['file_name'])
+            result[img_full_path] = []
+            img_id2path[img['id']] = img_full_path
+        for ann in coco_json['annotations']:
+            result[img_id2path[ann['image_id']]].append({\
+                'x1': float(ann['bbox'][0]), 'y1': float(ann['bbox'][1]), \
+                'x2':float(ann['bbox'][0]+ann['bbox'][2]), 'y2':float(ann['bbox'][1]+ann['bbox'][3]) , \
+                'class': int(ann['category_id']), 'obj_id': int(ann['track_id'])})
         return result
-
-    def name_to_label(self, name):
-        return self.classes[name]
-
-    def label_to_name(self, label):
-        return self.labels[label]
 
     def num_classes(self):
         return max(self.classes.values()) + 1
@@ -305,12 +189,273 @@ class CSVDataset(Dataset):
         return float(image.width) / float(image.height)
 
 
-def collater(data):
+class CrowdHumanDataset(Dataset):
+    """CoCo dataset."""
+    def __init__(self, root_path, train_file, transform=None):
+        """
+        Args:
+
+        """
+        super(CrowdHumanDataset, self).__init__()
+        self.train_file = train_file
+        self.transform = transform
+        self.root_path = root_path
+
+        # load annotations
+        print('loading annotations into memory')
+        with open(self.train_file, 'r') as fr:
+            coco_json = json.load(fr)
+        assert type(coco_json) == dict, 'annotation file format {} not supported'.format(type(coco_json))
+        self.classes = coco_json['categories']
+        self.image_data = self._read_annotations(coco_json)
+
+        self.image_names = list(self.image_data.keys())
+
+        print('total video count: {}'.format(len(self.image_names)))
+
+    def gen_fake_img_ann(self, img, annots, debug=False):
+        img_next, annots_next = copy.deepcopy(img), copy.deepcopy(annots)
+        height, width, depth = img.shape
+        # step 1: crop
+        crop_range = (0.9,1.0)
+        min_iou=0.4
+        crop_ratio = np.random.uniform(crop_range[0],crop_range[1])
+        crop_h = int(height*crop_ratio)
+        crop_w = int(width*crop_ratio)
+        crop_success = False
+        for _ in range(10):
+            left = np.random.uniform(0, width - crop_w)
+            top = np.random.uniform(0, height - crop_h)
+            # convert to integer rect x1,y1,x2,y2
+            rect = np.array([int(left), int(top), int(left + crop_w), int(top + crop_h)])
+            # calculate IoU (jaccard overlap) b/t the cropped and gt boxes
+            overlap = overlap_numpy(annots[:, :4], rect)
+            if overlap.max() < min_iou:
+                continue
+            crop_success = True
+            break
+        if not crop_success:
+            return img_next, annots_next
+        img_next = img_next[rect[1]:rect[3], rect[0]:rect[2], :]
+        annots_next = annots_next[overlap > min_iou, :]
+        annots_next[:, :2] -= rect[:2]
+        annots_next[:, 2:4] -= rect[:2]
+        # step 2: resize slightly
+        resize_range = (0.95,1.05)
+        resize_ratio = np.random.uniform(resize_range[0],resize_range[1])
+        resize_h = int(img_next.shape[0]*resize_ratio)
+        resize_w = int(img_next.shape[1]*resize_ratio)
+        img_next = (255.0 * skimage.transform.resize(img_next, (resize_h, resize_w))).astype(np.uint8)
+        annots_next[:, :4] *= resize_ratio
+        ## step 3: bbox shift and rescale slightly
+        # for i in range(len(annots_next)):
+        #     r = np.random.randn(4)/40
+        #     r = np.clip(r,a_min=-0.05,a_max=0.05)
+        #     annots_next[i][:4] += r*(annots_next[i][0]-annots_next[i][2])
+        #step4: padding img_next
+        pad_img_next = np.zeros((height,width,depth),dtype=img.dtype)
+        min_width = min(width, img_next.shape[1])
+        min_height = min(height,img_next.shape[0])
+        pad_img_next[:min_height, :min_width, :] = img_next[:min_height, :min_width, :]
+        if debug:
+            from matplotlib import pyplot as plt
+            import cv2
+            plt.figure(figsize=(32,16))
+            for ann in annots:
+                cv2.rectangle(img,(int(ann[0]),int(ann[1])),(int(ann[2]),int(ann[3])),color=(0,200,0),thickness=2)
+            for ann in annots_next:
+                cv2.rectangle(pad_img_next,(int(ann[0]),int(ann[1])),(int(ann[2]),int(ann[3])),color=(0,200,0),thickness=2)
+            plt.subplot(211)
+            plt.imshow(img)
+            plt.subplot(212)
+            plt.imshow(pad_img_next)
+            plt.show()
+            exit(0)
+
+        return pad_img_next,annots_next
+
+    def __len__(self):
+        return len(self.image_names)
+
+    def __getitem__(self, idx):
+        while True:
+            try:
+                img = self.load_image(idx)
+                annot = self.load_annotations(idx)
+                img_next,annot_next = self.gen_fake_img_ann(img, annot)
+
+                if (annot.shape[0] < 1) or (annot_next.shape[0] < 1):
+                    idx = random.randrange(0, len(self.image_names))
+                    continue
+            except FileNotFoundError:
+                print('FileNotFoundError in process image.')
+                idx = random.randrange(0, len(self.image_names))
+                continue
+            break
+
+        if np.random.rand() < 0.5:
+            sample = {'img': img, 'annot': annot, 'img_next': img_next, 'annot_next': annot_next}
+        else:
+            sample = {'img': img_next, 'annot': annot_next, 'img_next': img, 'annot_next': annot}
+        if self.transform:
+            sample = self.transform(sample)
+
+        return sample
+
+
+    def load_image(self, image_index_or_name):
+        if isinstance(image_index_or_name, int):
+            img = skimage.io.imread(self.image_names[image_index_or_name])
+        elif isinstance(image_index_or_name, str):
+            img = skimage.io.imread(image_index_or_name)
+        else:
+            raise ValueError('Expected int or str, but get {}'.format(type(image_index_or_name)))
+
+        if len(img.shape) == 2:
+            img = skimage.color.gray2rgb(img)
+
+        return img
+
+    def load_annotations(self, image_index_or_name):
+        # get ground truth annotations
+        if isinstance(image_index_or_name, int):
+            annotation_list = self.image_data[self.image_names[image_index_or_name]]
+        elif isinstance(image_index_or_name, str):
+            annotation_list = self.image_data[image_index_or_name]
+        else:
+            raise ValueError('Expected int or str, but get {}'.format(type(image_index_or_name)))
+
+        annotations = np.zeros((0, 6))
+
+        # some images appear to miss annotations (like image with id 257034)
+        if len(annotation_list) == 0:
+            return annotations
+
+        # parse annotations
+        for idx, a in enumerate(annotation_list):
+            # some annotations have basically no width / height, skip them
+            x1 = a['x1']
+            x2 = a['x2']
+            y1 = a['y1']
+            y2 = a['y2']
+            obj_id = a['obj_id']
+            category_id = a['class']
+            if category_id > 0:
+                category_id -= 1
+
+            if (x2 - x1) < 1 or (y2 - y1) < 1:
+                continue
+
+            annotation = np.zeros((1, 6))
+
+            annotation[0, 0] = x1
+            annotation[0, 1] = y1
+            annotation[0, 2] = x2
+            annotation[0, 3] = y2
+
+            annotation[0, 4] = category_id
+            annotation[0, 5] = obj_id
+            annotations = np.append(annotations, annotation, axis=0)
+
+        return annotations
+
+    def _read_annotations(self, coco_json):
+        result = {}
+        img_id2path = {}
+        for img in coco_json['images']:
+            img_full_path = os.path.join(self.root_path, img['file_name'])
+            result[img_full_path] = []
+            img_id2path[img['id']] = img_full_path
+        for ann in coco_json['annotations']:
+            result[img_id2path[ann['image_id']]].append({\
+                'x1': float(ann['bbox'][0]), 'y1': float(ann['bbox'][1]), \
+                'x2':float(ann['bbox'][0]+ann['bbox'][2]), 'y2':float(ann['bbox'][1]+ann['bbox'][3]) , \
+                'class': int(ann['category_id']), 'obj_id': int(ann['id'])})
+        return result
+
+    def num_classes(self):
+        return max(self.classes.values())
+
+    def image_aspect_ratio(self, image_index):
+        image = Image.open(self.image_names[image_index])
+        return float(image.width) / float(image.height)
+
+
+class CaltechPedestrianDataset(CrowdHumanDataset):
+    def __init__(self, root_path, train_file, transform=None):
+        super(CaltechPedestrianDataset,self).__init__(root_path,train_file,transform)
+
+def resize_collater(data):
     imgs = [s['img'] for s in data]
     annots = [s['annot'] for s in data]
     imgs_next = [s['img_next'] for s in data]
     annots_next = [s['annot_next'] for s in data]
         
+    widths = [int(s.shape[1]) for s in imgs]
+    heights = [int(s.shape[0]) for s in imgs]
+    batch_size = len(imgs)
+
+    mean_width = int(np.array(widths).mean())
+    mean_height = int(np.array(heights).mean())
+    mean_width += (32 - mean_width % 32)
+    mean_height += (32 - mean_height % 32)
+
+    align_imgs = []
+    align_imgs_next = []
+
+    for i in range(batch_size):
+        img = imgs[i]
+        height, width = img.shape[0], img.shape[1]
+        if annots[i].shape[0]>0:
+            annots[i][:, 0] *= (mean_width / width)
+            annots[i][:, 1] *= (mean_height / height)
+            annots[i][:, 2] *= (mean_width / width)
+            annots[i][:, 3] *= (mean_height / height)
+        img = img.view(1, height, width, -1).permute(0, 3, 1, 2)
+        img = F.interpolate(img, size=(mean_height, mean_width), mode='bilinear', align_corners=True)
+        align_imgs.append(img.view(-1,mean_height,mean_width))
+
+        img_next = imgs_next[i]
+        height, width = img_next.shape[0], img_next.shape[1]
+        if annots_next[i].shape[0] > 0:
+            annots_next[i][:, 0] *= (mean_width / width)
+            annots_next[i][:, 1] *= (mean_height / height)
+            annots_next[i][:, 2] *= (mean_width / width)
+            annots_next[i][:, 3] *= (mean_height / height)
+        img_next = img_next.view(1, height, width, -1).permute(0, 3, 1, 2)
+        img_next = F.interpolate(img_next, size=(mean_height, mean_width), mode='bilinear', align_corners=True)
+        align_imgs_next.append(img_next.view(-1, mean_height, mean_width))
+    align_imgs = torch.stack(align_imgs)
+    align_imgs_next = torch.stack(align_imgs_next)
+
+    max_num_annots = max(annot.shape[0] for annot in annots)
+    max_num_annots_next = max(annot.shape[0] for annot in annots_next)
+    max_num_annots = max(max_num_annots, max_num_annots_next)
+    if max_num_annots > 0:
+        annot_padded = torch.ones((len(annots), max_num_annots, 6)) * -1
+        for idx, annot in enumerate(annots):
+            if annot.shape[0] > 0:
+                annot_padded[idx, :annot.shape[0], :] = annot
+    else:
+        annot_padded = torch.ones((len(annots), 1, 6)) * -1
+    
+    if max_num_annots > 0:
+        annot_padded_next = torch.ones((len(annots_next), max_num_annots, 6)) * -1
+        for idx, annot in enumerate(annots_next):
+            if annot.shape[0] > 0:
+                annot_padded_next[idx, :annot.shape[0], :] = annot
+    else:
+        annot_padded_next = torch.ones((len(annots_next), 1, 6)) * -1
+
+    return {'img': align_imgs, 'annot': annot_padded, 'img_next': align_imgs_next, 'annot_next': annot_padded_next}
+
+
+def pad_collater(data):
+    imgs = [s['img'] for s in data]
+    annots = [s['annot'] for s in data]
+    imgs_next = [s['img_next'] for s in data]
+    annots_next = [s['annot_next'] for s in data]
+
     widths = [int(s.shape[1]) for s in imgs]
     heights = [int(s.shape[0]) for s in imgs]
     batch_size = len(imgs)
@@ -339,7 +484,7 @@ def collater(data):
                     annot_padded[idx, :annot.shape[0], :] = annot
     else:
         annot_padded = torch.ones((len(annots), 1, 6)) * -1
-    
+
     if max_num_annots > 0:
         annot_padded_next = torch.ones((len(annots_next), max_num_annots, 6)) * -1
 
@@ -349,7 +494,6 @@ def collater(data):
                     annot_padded_next[idx, :annot.shape[0], :] = annot
     else:
         annot_padded_next = torch.ones((len(annots_next), 1, 6)) * -1
-
 
     padded_imgs = padded_imgs.permute(0, 3, 1, 2)
     padded_imgs_next = padded_imgs_next.permute(0, 3, 1, 2)
@@ -542,7 +686,7 @@ class Compose(object):
 
 
 class RandomResize(object):
-    def __init__(self, resize_range=(0.6, 1.0)):
+    def __init__(self, resize_range=(0.4, 1.0)):
         self.resize_range=resize_range
         assert isinstance(resize_range, tuple) and resize_range[0] < resize_range[1]
 

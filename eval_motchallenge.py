@@ -37,6 +37,7 @@ string.""", formatter_class=argparse.RawTextHelpFormatter)
 
     parser.add_argument('groundtruths', type=str, help='Directory containing ground truth files.')
     parser.add_argument('tests', type=str, help='Directory containing tracker result files')
+    parser.add_argument('gt_name', type=str, default='gt.txt')
     parser.add_argument('--eval_official', action='store_true')
     parser.add_argument('--fmt', type=str, help='Data format', default='mot15-2D')
     parser.add_argument('--solver', type=str, help='LAP solver to use')
@@ -62,7 +63,7 @@ if __name__ == '__main__':
         mm.lap.default_solver = args.solver
 
     gtfiles = glob.glob(
-      os.path.join(args.groundtruths, '*/gt/gt.txt'))
+      os.path.join(args.groundtruths, '*/gt', args.gt_name))
     print('gt_files', gtfiles)
     tsfiles = [f for f in glob.glob(os.path.join(args.tests, '*.txt'))]
 

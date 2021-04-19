@@ -1,6 +1,7 @@
 import numpy as np
 import math
 import os
+os.environ["CUDA_VISIBLE_DEVICES"]="4,5,6,7"
 import argparse
 import cv2
 import skimage.io
@@ -12,6 +13,7 @@ import torch
 from tqdm import tqdm
 from dataloader import RGB_MEAN, RGB_STD
 from scipy.optimize import linear_sum_assignment
+from RepVgg import repvgg_model_convert
 
 #assert torch.__version__.split('.')[1] == '4'
 
@@ -136,11 +138,24 @@ def draw_caption(image, box, caption, color):
 
 
 def run_each_dataset(model_dir, FcosTracker, dataset_path, subset, cur_dataset, parser):
-    img_list = os.listdir(os.path.join(dataset_path, subset, cur_dataset, 'img1'))
-    img_list = [os.path.join(dataset_path, subset, cur_dataset, 'img1', _) for _ in img_list if
-                ('jpg' in _) or ('png' in _)]
+    if not parser.val_half:
+        img_list = os.listdir(os.path.join(dataset_path, subset, cur_dataset, 'img1'))
+        img_list = [os.path.join(dataset_path, subset, cur_dataset, 'img1', _) for _ in img_list if
+                    ('jpg' in _) or ('png' in _)]
+    else:
+        img_list = [line.strip() for line in open(os.path.join(dataset_path,subset,cur_dataset,'gt/half_val_image.txt'))]
+        img_list = [os.path.join(dataset_path,subset,cur_dataset,'img1',_) for _ in img_list]
+    # img_list_all = os.listdir(os.path.join(dataset_path, subset, cur_dataset, 'img1'))
+    # img_list_all = [os.path.join(dataset_path, subset, cur_dataset, 'img1', _) for _ in img_list_all if
+    #             ('jpg' in _) or ('png' in _)]
+    # img_list_half = [line.strip() for line in open(os.path.join(dataset_path,subset,cur_dataset,'gt/half_val_image.txt'))]
+    # img_list_half = [os.path.join(dataset_path,subset,cur_dataset,'img1',_) for _ in img_list_half]
+    #
+    # img_list = []
+    # for im in img_list_all:
+    #     if im not in img_list_half:
+    #         img_list.append(im)
     img_list = sorted(img_list)
-
     img_len = len(img_list)
     last_feat = None
 
@@ -297,16 +312,21 @@ def run_each_dataset(model_dir, FcosTracker, dataset_path, subset, cur_dataset, 
         if parser.save_video:
             videoWriter.release()
 
-def eval_metrics(gt_root, dt_root):
+def eval_metrics(gt_root, dt_root, val_half):
+    if val_half:
+        gt_name = 'gt_half_val.txt'
+    else:
+        gt_name = 'gt.txt'
     os.system('/home/chenchao/miniconda3/envs/py36/bin/python eval_motchallenge.py ' + \
               ' {} '.format(gt_root) + \
-              ' {} '.format(dt_root) +\
+              ' {} '.format(dt_root) + \
+              ' {} '.format(gt_name) + \
               ' --eval_official')
     pass
 
 def main():
     parser = argparse.ArgumentParser(description='Simple script for testing a CTracker network.')
-    parser.add_argument('--dataset_path', default='./data', type=str,
+    parser.add_argument('--dataset_path', default='./data/mot17', type=str,
                         help='Dataset path, location of the images sequence.')
     parser.add_argument('--model_dir', default='./models', help='Path to model (.pt) file.')
     parser.add_argument('--model_name', default='model_final.pt',
@@ -316,6 +336,7 @@ def main():
     parser.add_argument('--save_image', action='store_true', help='Whether to visulize results as image format.')
     parser.add_argument('--show_conf', action='store_true', help='Show predict confidence heatmap.')
     parser.add_argument('--multi_test', action='store_true', help='Whether use torch.multiprocessing.')
+    parser.add_argument('--val_half', action='store_true', help='Whether to test on val_half dataset.')
     parser = parser.parse_args()
 
     if not os.path.exists(os.path.join(parser.model_dir, 'results')):
@@ -324,6 +345,7 @@ def main():
     FcosTracker = torch.load(os.path.join(parser.model_dir, parser.model_name))
     if isinstance(FcosTracker, torch.nn.DataParallel):
         FcosTracker = FcosTracker.module
+    FcosTracker = repvgg_model_convert(FcosTracker)
     use_gpu = True
     if use_gpu: FcosTracker = FcosTracker.cuda()
     FcosTracker.eval()
@@ -334,6 +356,7 @@ def main():
         processes = []
 
     for seq_num in [2, 4, 5, 9, 10, 11, 13]:
+    #for seq_num in [13]:
         if parser.multi_test:
             p = torch.multiprocessing.Process(target=run_each_dataset, args=(parser.model_dir, FcosTracker, parser.dataset_path, 'train', 'MOT17-{:02d}'.format(seq_num), parser))
             p.start()
@@ -348,7 +371,7 @@ def main():
         for seq_num in [1, 3, 6, 7, 8, 12, 14]:
             run_each_dataset(parser.model_dir, FcosTracker, parser.dataset_path, 'test', 'MOT17-{:02d}'.format(seq_num), parser)
 
-    eval_metrics(os.path.join(parser.dataset_path,'train'),os.path.join(parser.model_dir,'results'))
+    eval_metrics(os.path.join(parser.dataset_path,'train'),os.path.join(parser.model_dir,'results'),parser.val_half)
 
 if __name__ == '__main__':
     main()
